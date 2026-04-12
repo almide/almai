@@ -1,0 +1,36 @@
+import process
+
+type Message = { role: String, content: String }
+type LLMResponse = { content: String, model: String, usage: Usage, finish_reason: String, tool_calls: List[ToolCall] }
+type Usage = { prompt_tokens: Int, completion_tokens: Int, total_tokens: Int }
+type ToolCall = { id: String, name: String, arguments: String }
+type CallOptions = { max_tokens: Int, temperature: Float, top_p: Float, system: String, stop: List[String], tools: List[Tool], json_mode: Bool }
+type Tool = { name: String, description: String, parameters: Value }
+
+fn resolve_system(msgs: List[Message], opts: CallOptions) -> String =
+  if opts.system != "" then opts.system
+  else list.find(msgs, (m) => m.role == "system")
+    |> option.map((m) => m.content) |> option.unwrap_or("")
+
+fn last_user(msgs: List[Message]) -> String =
+  list.last(msgs) |> option.map((m) => m.content) |> option.unwrap_or("")
+
+effect fn call_claude(msgs: List[Message], opts: CallOptions) -> Result[LLMResponse, String] = {
+  let user_msg = last_user(msgs)
+  let sys = resolve_system(msgs, opts)
+  let args = if sys != "" then ["--print", "--system-prompt", sys, user_msg] else ["--print", user_msg]
+  match process.exec("claude", args) {
+    err(e) => err("claude cli: " + e)
+    ok(raw) => ok(LLMResponse {
+      content: string.trim(raw), model: "claude-cli",
+      usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      finish_reason: "stop", tool_calls: [],
+    })
+  }
+}
+
+test "resolve_system from opts" {
+  let msgs = [Message { role: "user", content: "hi" }]
+  let opts = CallOptions { max_tokens: 100, temperature: 0.0, top_p: 1.0, system: "sys", stop: [], tools: [], json_mode: false }
+  assert_eq(resolve_system(msgs, opts), "sys")
+}

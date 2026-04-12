@@ -27,6 +27,7 @@ import env
 import http
 import json
 import process
+import self.providers.cli as cli
 
 // ── Core types ──
 
@@ -412,28 +413,7 @@ effect fn call_google(
     }
   }
 
-// ── CLI adapters ──
-
-effect fn call_cli_claude(msgs: List[Message], opts: CallOptions) -> Result[LLMResponse, String] = {
-  let user_msg = list.last(msgs) |> option.map((m) => m.content) |> option.unwrap_or("")
-  let sys = if opts.system != "" then opts.system
-    else list.find(msgs, (m) => m.role == "system")
-      |> option.map((m) => m.content) |> option.unwrap_or("")
-  let args = if sys != "" then ["--print", "--system-prompt", sys, user_msg]
-    else ["--print", user_msg]
-  match process.exec("claude", args) {
-    err(e) => err("claude cli: " + e)
-    ok(raw) => ok(empty_response(raw, "claude-cli"))
-  }
-}
-
-effect fn call_cli_codex(msgs: List[Message], opts: CallOptions) -> Result[LLMResponse, String] = {
-  let user_msg = list.last(msgs) |> option.map((m) => m.content) |> option.unwrap_or("")
-  match process.exec("codex", ["exec", user_msg]) {
-    err(e) => err("codex cli: " + e)
-    ok(raw) => ok(empty_response(raw, "codex-cli"))
-  }
-}
+// ── CLI adapters (delegated to providers.cli) ──
 
 // ── Public API ──
 
@@ -459,8 +439,8 @@ effect fn call_with(model_spec: String, msgs: List[Message], opts: CallOptions) 
     "azure" => call_azure(model, msgs, opts),
     "google" => call_google(model, msgs, opts),
     "cli" => match model {
-      "claude" => call_cli_claude(msgs, opts),
-      "codex" => call_cli_codex(msgs, opts),
+      "claude" => cli.call_claude(msgs, opts),
+      _ => err("unknown cli: " + model),
       _ => err("unknown cli: " + model),
     },
     _ => err("unknown provider: " + provider),
