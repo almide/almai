@@ -27,7 +27,7 @@ import env
 import http
 import json
 import process
-import self.providers.cli as cli
+import self.providers.cli as cli_provider
 
 // ── Core types ──
 
@@ -439,7 +439,7 @@ effect fn call_with(model_spec: String, msgs: List[Message], opts: CallOptions) 
     "azure" => call_azure(model, msgs, opts),
     "google" => call_google(model, msgs, opts),
     "cli" => match model {
-      "claude" => cli.call_claude(msgs, opts),
+      "claude" => cli_provider.call_claude(msgs, opts),
       _ => err("unknown cli: " + model),
       _ => err("unknown cli: " + model),
     },
