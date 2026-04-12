@@ -1,0 +1,379 @@
+// almai — Multi-provider LLM client for Almide
+//
+// Unified interface for calling LLMs across providers.
+// Provider format follows LiteLLM convention: "provider/model-id"
+//
+// Usage:
+//   import relay
+//
+//   let response = relay.call("anthropic/claude-sonnet-4-6", [
+//     relay.system("You are helpful."),
+//     relay.user("Hello"),
+//   ])!
+//   println(response.content)
+//
+// Providers:
+//   anthropic/claude-*           Anthropic Messages API
+//   openai/gpt-*                OpenAI Chat Completions
+//   cloudflare/@cf/*             Cloudflare Workers AI
+//   openrouter/*                 OpenRouter (100+ models)
+//   bedrock/anthropic.*          AWS Bedrock
+//   vertex/claude-*              Google Vertex AI
+//   cli/claude                   Claude Code CLI
+//   cli/codex                    Codex CLI
+//   cli/gemini                   Gemini CLI
+
+import env
+import http
+import json
+import process
+
+// ── Types ──
+
+type Message = {
+  role: String,
+  content: String,
+}
+
+type LLMResponse = {
+  content: String,
+  model: String,
+  usage: Usage,
+  finish_reason: String,
+}
+
+type Usage = {
+  prompt_tokens: Int,
+  completion_tokens: Int,
+  total_tokens: Int,
+}
+
+type CallOptions = {
+  max_tokens: Int,
+  temperature: Float,
+  system: String,
+}
+
+// ── Message constructors ──
+
+fn system(content: String) -> Message =
+  Message { role: "system", content: content }
+
+fn user(content: String) -> Message =
+  Message { role: "user", content: content }
+
+fn assistant(content: String) -> Message =
+  Message { role: "assistant", content: content }
+
+// ── Default options ──
+
+fn defaults() -> CallOptions =
+  CallOptions { max_tokens: 4096, temperature: 0.0, system: "" }
+
+fn with_max_tokens(opts: CallOptions, n: Int) -> CallOptions =
+  CallOptions { max_tokens: n, temperature: opts.temperature, system: opts.system }
+
+fn with_temperature(opts: CallOptions, t: Float) -> CallOptions =
+  CallOptions { max_tokens: opts.max_tokens, temperature: t, system: opts.system }
+
+fn with_system(opts: CallOptions, s: String) -> CallOptions =
+  CallOptions { max_tokens: opts.max_tokens, temperature: opts.temperature, system: s }
+
+// ── Provider parsing ──
+
+fn parse_provider(model_spec: String) -> (String, String) = {
+  let idx = string.index_of(model_spec, "/") |> option.unwrap_or(-1)
+  if idx < 0 then ("openai", model_spec)
+  else (string.take(model_spec, idx), string.drop(model_spec, idx + 1))
+}
+
+// ── JSON helpers ──
+
+fn messages_to_json(msgs: List[Message]) -> Value =
+  json.array(list.map(msgs, (m) =>
+    json.object([("role", json.from_string(m.role)), ("content", json.from_string(m.content))])
+  ))
+
+fn extract_string(v: Value, key: String) -> String =
+  json.get_string(v, key) |> option.unwrap_or("")
+
+fn extract_int(v: Value, key: String) -> Int =
+  json.get_int(v, key) |> option.unwrap_or(0)
+
+fn parse_usage(v: Value) -> Usage = {
+  let u = json.get(v, "usage") |> option.unwrap_or(json.null())
+  Usage {
+    prompt_tokens: extract_int(u, "prompt_tokens"),
+    completion_tokens: extract_int(u, "completion_tokens"),
+    total_tokens: extract_int(u, "total_tokens"),
+  }
+}
+
+// ── Environment helpers ──
+
+effect fn require_env(key: String) -> Result[String, String] =
+  match env.get(key) {
+    some(v) => if v == "" then err("empty env: " + key) else ok(v)
+    none => err("missing env: " + key)
+  }
+
+effect fn post_json(url: String, body: Value, headers: Map[String, String]) -> Result[Value, String] =
+  match http.request("POST", url, json.stringify(body), headers) {
+    err(e) => err("http: " + e)
+    ok(raw) => match json.parse(raw) {
+      err(e) => err("json: " + e + " body: " + string.take(raw, 200))
+      ok(parsed) => ok(parsed)
+    }
+  }
+
+// ── OpenAI-compatible provider (OpenAI, OpenRouter, LiteLLM proxy) ──
+
+effect fn call_openai_compat(
+  base_url: String,
+  api_key: String,
+  model: String,
+  msgs: List[Message],
+  opts: CallOptions,
+) -> Result[LLMResponse, String] = {
+  let sys_msgs = if opts.system != "" then [system(opts.system)] else []
+  let all_msgs = sys_msgs + msgs
+  let body = json.object([
+    ("model", json.from_string(model)),
+    ("messages", messages_to_json(all_msgs)),
+    ("max_tokens", json.from_int(opts.max_tokens)),
+  ])
+  let headers: Map[String, String] = [
+    "Authorization": "Bearer " + api_key,
+    "Content-Type": "application/json",
+  ]
+  match post_json(base_url + "/chat/completions", body, headers) {
+    err(e) => err(e)
+    ok(parsed) => {
+      let content = json.get_array(parsed, "choices")
+        |> option.flat_map((choices) => list.first(choices))
+        |> option.flat_map((c) => json.get(c, "message"))
+        |> option.flat_map((m) => json.get_string(m, "content"))
+        |> option.unwrap_or("")
+      let finish = json.get_array(parsed, "choices")
+        |> option.flat_map((choices) => list.first(choices))
+        |> option.flat_map((c) => json.get_string(c, "finish_reason"))
+        |> option.unwrap_or("stop")
+      ok(LLMResponse {
+        content: string.trim(content),
+        model: extract_string(parsed, "model"),
+        usage: parse_usage(parsed),
+        finish_reason: finish,
+      })
+    }
+  }
+}
+
+// ── Anthropic Messages API ──
+
+effect fn call_anthropic(
+  model: String,
+  msgs: List[Message],
+  opts: CallOptions,
+) -> Result[LLMResponse, String] =
+  match require_env("ANTHROPIC_API_KEY") {
+    err(e) => err(e)
+    ok(api_key) => {
+      let user_msgs = list.filter(msgs, (m) => m.role != "system")
+      let sys = if opts.system != "" then opts.system
+        else list.find(msgs, (m) => m.role == "system")
+          |> option.map((m) => m.content)
+          |> option.unwrap_or("")
+      let body = json.object([
+        ("model", json.from_string(model)),
+        ("max_tokens", json.from_int(opts.max_tokens)),
+        ("system", json.from_string(sys)),
+        ("messages", messages_to_json(user_msgs)),
+      ])
+      let headers: Map[String, String] = [
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+      ]
+      match post_json("https://api.anthropic.com/v1/messages", body, headers) {
+        err(e) => err("anthropic: " + e)
+        ok(parsed) => {
+          let content = json.get_array(parsed, "content")
+            |> option.flat_map((blocks) => list.first(blocks))
+            |> option.flat_map((b) => json.get_string(b, "text"))
+            |> option.unwrap_or("")
+          ok(LLMResponse {
+            content: string.trim(content),
+            model: extract_string(parsed, "model"),
+            usage: parse_usage(parsed),
+            finish_reason: extract_string(parsed, "stop_reason"),
+          })
+        }
+      }
+    }
+  }
+
+// ── Cloudflare Workers AI ──
+
+effect fn resolve_cf_account() -> Result[String, String] =
+  match require_env("CF_ACCOUNT_ID") {
+    ok(v) => ok(v)
+    err(_) => require_env("CLOUDFLARE_ACCOUNT_ID")
+  }
+
+effect fn call_cloudflare(
+  model: String,
+  msgs: List[Message],
+  opts: CallOptions,
+) -> Result[LLMResponse, String] =
+  match resolve_cf_account() {
+    err(e) => err(e)
+    ok(account_id) => match require_env("CLOUDFLARE_API_KEY") {
+      err(e) => err(e)
+      ok(api_key) => match require_env("CLOUDFLARE_EMAIL") {
+        err(_) => err("cloudflare: need CLOUDFLARE_EMAIL for Global API Key auth")
+        ok(email) => {
+          let sys_msgs = if opts.system != "" then [system(opts.system)] else []
+          let all_msgs = sys_msgs + msgs
+        let url = "https://api.cloudflare.com/client/v4/accounts/" + account_id + "/ai/run/" + model
+        let body = json.object([("messages", messages_to_json(all_msgs))])
+        let headers: Map[String, String] = [
+          "X-Auth-Key": api_key,
+          "X-Auth-Email": email,
+          "Content-Type": "application/json",
+        ]
+        match post_json(url, body, headers) {
+          err(e) => err("cloudflare: " + e)
+          ok(parsed) => {
+            let content = json.get(parsed, "result")
+              |> option.flat_map((r) => json.get_string(r, "response"))
+              |> option.unwrap_or("")
+            ok(LLMResponse {
+              content: string.trim(content),
+              model: model,
+              usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+              finish_reason: "stop",
+            })
+          }
+        }
+      }
+    }
+  }
+}
+
+// ── CLI adapters ──
+
+effect fn call_cli_claude(
+  msgs: List[Message],
+  opts: CallOptions,
+) -> Result[LLMResponse, String] = {
+  let user_msg = list.last(msgs) |> option.map((m) => m.content) |> option.unwrap_or("")
+  let sys = if opts.system != "" then opts.system
+    else list.find(msgs, (m) => m.role == "system")
+      |> option.map((m) => m.content)
+      |> option.unwrap_or("")
+  let args = if sys != "" then ["--print", "--system-prompt", sys, user_msg]
+    else ["--print", user_msg]
+  match process.exec("claude", args) {
+    err(e) => err("claude cli: " + e)
+    ok(raw) => ok(LLMResponse {
+      content: string.trim(raw),
+      model: "claude-cli",
+      usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      finish_reason: "stop",
+    })
+  }
+}
+
+effect fn call_cli_codex(
+  msgs: List[Message],
+  opts: CallOptions,
+) -> Result[LLMResponse, String] = {
+  let user_msg = list.last(msgs) |> option.map((m) => m.content) |> option.unwrap_or("")
+  match process.exec("codex", ["exec", user_msg]) {
+    err(e) => err("codex cli: " + e)
+    ok(raw) => ok(LLMResponse {
+      content: string.trim(raw),
+      model: "codex-cli",
+      usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      finish_reason: "stop",
+    })
+  }
+}
+
+// ── Unified dispatch ──
+
+effect fn call(model_spec: String, msgs: List[Message]) -> Result[LLMResponse, String] =
+  call_with(model_spec, msgs, defaults())
+
+effect fn call_with(model_spec: String, msgs: List[Message], opts: CallOptions) -> Result[LLMResponse, String] = {
+  let parsed = parse_provider(model_spec)
+  let provider = parsed.0
+  let model = parsed.1
+
+  if provider == "anthropic" then call_anthropic(model, msgs, opts)
+  else if provider == "openai" then
+    match require_env("OPENAI_API_KEY") {
+      err(e) => err(e)
+      ok(key) => call_openai_compat("https://api.openai.com/v1", key, model, msgs, opts)
+    }
+  else if provider == "openrouter" then
+    match require_env("OPENROUTER_API_KEY") {
+      err(e) => err(e)
+      ok(key) => call_openai_compat("https://openrouter.ai/api/v1", key, model, msgs, opts)
+    }
+  else if provider == "cloudflare" or provider == "cf" then
+    call_cloudflare(model, msgs, opts)
+  else if provider == "litellm" then
+    match require_env("LITELLM_API_KEY") {
+      err(e) => call_openai_compat("http://localhost:4000/v1", "", model, msgs, opts)
+      ok(key) => call_openai_compat("http://localhost:4000/v1", key, model, msgs, opts)
+    }
+  else if provider == "cli" then
+    if model == "claude" then call_cli_claude(msgs, opts)
+    else if model == "codex" then call_cli_codex(msgs, opts)
+    else err("unknown cli: " + model)
+  else
+    err("unknown provider: " + provider + ". Use anthropic/, openai/, cloudflare/, openrouter/, litellm/, or cli/")
+}
+
+// ── Tests ──
+
+test "parse_provider with slash" {
+  let p = parse_provider("anthropic/claude-sonnet-4-6")
+  assert_eq(p.0, "anthropic")
+  assert_eq(p.1, "claude-sonnet-4-6")
+}
+
+test "parse_provider no slash defaults to openai" {
+  let p = parse_provider("gpt-4o")
+  assert_eq(p.0, "openai")
+  assert_eq(p.1, "gpt-4o")
+}
+
+test "parse_provider cloudflare" {
+  let p = parse_provider("cf/@cf/meta/llama-3.3-70b")
+  assert_eq(p.0, "cf")
+  assert_eq(p.1, "@cf/meta/llama-3.3-70b")
+}
+
+test "system message" {
+  let m = system("hello")
+  assert_eq(m.role, "system")
+  assert_eq(m.content, "hello")
+}
+
+test "user message" {
+  let m = user("world")
+  assert_eq(m.role, "user")
+  assert_eq(m.content, "world")
+}
+
+test "defaults" {
+  let d = defaults()
+  assert_eq(d.max_tokens, 4096)
+}
+
+test "with_max_tokens" {
+  let d = defaults() |> with_max_tokens(8192)
+  assert_eq(d.max_tokens, 8192)
+}

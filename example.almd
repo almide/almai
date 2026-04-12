@@ -1,0 +1,15 @@
+import self as almai
+
+effect fn main() -> Unit = {
+  let response = almai.call("cf/@cf/meta/llama-3.3-70b-instruct-fp8-fast", [
+    almai.system("Reply in one word."),
+    almai.user("What is 1+1?"),
+  ])
+  match response {
+    ok(r) => {
+      println("Content: " + r.content)
+      println("Model: " + r.model)
+    }
+    err(e) => println("Error: " + e)
+  }
+}
