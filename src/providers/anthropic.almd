@@ -1,0 +1,66 @@
+// almai.providers.anthropic — Anthropic Messages API
+
+import env
+import http
+import json
+
+type Message = { role: String, content: String }
+type LLMResponse = { content: String, model: String, usage: Usage, finish_reason: String, tool_calls: List[ToolCall] }
+type Usage = { prompt_tokens: Int, completion_tokens: Int, total_tokens: Int }
+type ToolCall = { id: String, name: String, arguments: String }
+type Tool = { name: String, description: String, parameters: Value }
+type CallOptions = { max_tokens: Int, temperature: Float, top_p: Float, system: String, stop: List[String], tools: List[Tool], json_mode: Bool }
+
+fn messages_to_json(msgs: List[Message]) -> Value =
+  json.array(list.map(msgs, (m) =>
+    json.object([("role", json.from_string(m.role)), ("content", json.from_string(m.content))])))
+
+fn es(v: Value, key: String) -> String = json.get_string(v, key) |> option.unwrap_or("")
+
+effect fn require_env(key: String) -> Result[String, String] =
+  match env.get(key) { some(v) => if v == "" then err("empty env: " + key) else ok(v), none => err("missing env: " + key) }
+
+effect fn post_json(url: String, body: Value, headers: Map[String, String]) -> Result[Value, String] =
+  match http.request("POST", url, json.stringify(body), headers) {
+    err(e) => err("http: " + e)
+    ok(raw) => match json.parse(raw) {
+      err(e) => err("json: " + e)
+      ok(parsed) => match json.get(parsed, "error") |> option.flat_map((e) => json.get_string(e, "message")) {
+        some(msg) => err("api: " + msg)
+        none => ok(parsed)
+      }
+    }
+  }
+
+effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[LLMResponse, String] =
+  match require_env("ANTHROPIC_API_KEY") {
+    err(e) => err(e)
+    ok(api_key) => {
+      let user_msgs = list.filter(msgs, (m) => m.role != "system")
+      let sys = if opts.system != "" then opts.system
+        else list.find(msgs, (m) => m.role == "system") |> option.map((m) => m.content) |> option.unwrap_or("")
+      let fields = [("model", json.from_string(model)), ("max_tokens", json.from_int(opts.max_tokens)), ("messages", messages_to_json(user_msgs))]
+      let fields = if sys != "" then fields + [("system", json.from_string(sys))] else fields
+      let fields = if not list.is_empty(opts.tools) then
+        fields + [("tools", json.array(list.map(opts.tools, (t) => json.object([
+          ("name", json.from_string(t.name)), ("description", json.from_string(t.description)), ("input_schema", t.parameters)]))))]
+      else fields
+      let body = json.object(fields)
+      match post_json("https://api.anthropic.com/v1/messages", body, ["x-api-key": api_key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"]) {
+        err(e) => err("anthropic: " + e)
+        ok(parsed) => {
+          let blocks = json.get_array(parsed, "content") |> option.unwrap_or([])
+          let text = blocks |> list.filter_map((b) => if es(b, "type") == "text" then json.get_string(b, "text") else none) |> string.join("")
+          let tc = blocks |> list.filter_map((b) =>
+            if es(b, "type") == "tool_use" then some(ToolCall { id: es(b, "id"), name: es(b, "name"),
+              arguments: json.get(b, "input") |> option.map((v) => json.stringify(v)) |> option.unwrap_or("{}") }) else none)
+          ok(LLMResponse { content: string.trim(text), model: es(parsed, "model"),
+            usage: { let u = json.get(parsed, "usage") |> option.unwrap_or(json.null())
+              Usage { prompt_tokens: json.get_int(u, "prompt_tokens") |> option.unwrap_or(0),
+                completion_tokens: json.get_int(u, "completion_tokens") |> option.unwrap_or(0),
+                total_tokens: json.get_int(u, "total_tokens") |> option.unwrap_or(0) } },
+            finish_reason: es(parsed, "stop_reason"), tool_calls: tc })
+        }
+      }
+    }
+  }

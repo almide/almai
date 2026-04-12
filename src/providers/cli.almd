@@ -29,6 +29,18 @@ effect fn call_claude(msgs: List[Message], opts: CallOptions) -> Result[LLMRespo
   }
 }
 
+effect fn call_codex(msgs: List[Message], opts: CallOptions) -> Result[LLMResponse, String] = {
+  let user_msg = last_user(msgs)
+  match process.exec("codex", ["exec", user_msg]) {
+    err(e) => err("codex cli: " + e)
+    ok(raw) => ok(LLMResponse {
+      content: string.trim(raw), model: "codex-cli",
+      usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      finish_reason: "stop", tool_calls: [],
+    })
+  }
+}
+
 test "resolve_system from opts" {
   let msgs = [Message { role: "user", content: "hi" }]
   let opts = CallOptions { max_tokens: 100, temperature: 0.0, top_p: 1.0, system: "sys", stop: [], tools: [], json_mode: false }
