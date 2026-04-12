@@ -20,6 +20,8 @@
 //   bedrock/anthropic.*          AWS Bedrock
 //   vertex/claude-*              Google Vertex AI
 //   cli/claude                   Claude Code CLI
+//   azure/{deployment}            Azure OpenAI
+//   google/gemini-*              Google Gemini (AI Studio / Vertex)
 //   cli/codex                    Codex CLI
 //   cli/gemini                   Gemini CLI
 
@@ -260,6 +262,101 @@ effect fn call_cloudflare(
   }
 }
 
+// ── Azure OpenAI ──
+//
+// POST https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version=2024-06-01
+// api-key: {key}
+
+effect fn call_azure(
+  model: String,
+  msgs: List[Message],
+  opts: CallOptions,
+) -> Result[LLMResponse, String] =
+  match require_env("AZURE_OPENAI_API_KEY") {
+    err(e) => err(e)
+    ok(api_key) => match require_env("AZURE_OPENAI_ENDPOINT") {
+      err(e) => err(e)
+      ok(endpoint) => {
+        let sys_msgs = if opts.system != "" then [system(opts.system)] else []
+        let all_msgs = sys_msgs + msgs
+        let url = endpoint + "/openai/deployments/" + model + "/chat/completions?api-version=2024-06-01"
+        let body = json.object([
+          ("messages", messages_to_json(all_msgs)),
+          ("max_tokens", json.from_int(opts.max_tokens)),
+        ])
+        let headers: Map[String, String] = [
+          "api-key": api_key,
+          "Content-Type": "application/json",
+        ]
+        match post_json(url, body, headers) {
+          err(e) => err("azure: " + e)
+          ok(parsed) => {
+            let content = json.get_array(parsed, "choices")
+              |> option.flat_map((choices) => list.first(choices))
+              |> option.flat_map((c) => json.get(c, "message"))
+              |> option.flat_map((m) => json.get_string(m, "content"))
+              |> option.unwrap_or("")
+            ok(LLMResponse {
+              content: string.trim(content),
+              model: model,
+              usage: parse_usage(parsed),
+              finish_reason: "stop",
+            })
+          }
+        }
+      }
+    }
+  }
+
+// ── Google Gemini (AI Studio / Vertex AI) ──
+//
+// POST https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}
+
+effect fn call_google(
+  model: String,
+  msgs: List[Message],
+  opts: CallOptions,
+) -> Result[LLMResponse, String] =
+  match require_env("GOOGLE_API_KEY") {
+    err(e) => err(e)
+    ok(api_key) => {
+      let sys_msgs = if opts.system != "" then [system(opts.system)] else []
+      let all_msgs = sys_msgs + msgs
+      let parts = list.map(all_msgs, (m) =>
+        json.object([
+          ("role", json.from_string(if m.role == "assistant" then "model" else "user")),
+          ("parts", json.array([json.object([("text", json.from_string(m.content))])])),
+        ])
+      )
+      let url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + api_key
+      let body = json.object([
+        ("contents", json.array(parts)),
+        ("generationConfig", json.object([
+          ("maxOutputTokens", json.from_int(opts.max_tokens)),
+        ])),
+      ])
+      let headers: Map[String, String] = ["Content-Type": "application/json"]
+      match post_json(url, body, headers) {
+        err(e) => err("google: " + e)
+        ok(parsed) => {
+          let content = json.get_array(parsed, "candidates")
+            |> option.flat_map((cands) => list.first(cands))
+            |> option.flat_map((c) => json.get(c, "content"))
+            |> option.flat_map((ct) => json.get_array(ct, "parts"))
+            |> option.flat_map((parts) => list.first(parts))
+            |> option.flat_map((p) => json.get_string(p, "text"))
+            |> option.unwrap_or("")
+          ok(LLMResponse {
+            content: string.trim(content),
+            model: model,
+            usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            finish_reason: "stop",
+          })
+        }
+      }
+    }
+  }
+
 // ── CLI adapters ──
 
 effect fn call_cli_claude(
@@ -323,17 +420,16 @@ effect fn call_with(model_spec: String, msgs: List[Message], opts: CallOptions) 
     }
   else if provider == "cloudflare" or provider == "cf" then
     call_cloudflare(model, msgs, opts)
-  else if provider == "litellm" then
-    match require_env("LITELLM_API_KEY") {
-      err(e) => call_openai_compat("http://localhost:4000/v1", "", model, msgs, opts)
-      ok(key) => call_openai_compat("http://localhost:4000/v1", key, model, msgs, opts)
-    }
+  else if provider == "azure" then
+    call_azure(model, msgs, opts)
+  else if provider == "google" then
+    call_google(model, msgs, opts)
   else if provider == "cli" then
     if model == "claude" then call_cli_claude(msgs, opts)
     else if model == "codex" then call_cli_codex(msgs, opts)
     else err("unknown cli: " + model)
   else
-    err("unknown provider: " + provider + ". Use anthropic/, openai/, cloudflare/, openrouter/, litellm/, or cli/")
+    err("unknown provider: " + provider + ". Use anthropic/, openai/, openrouter/, cloudflare/, azure/, google/, or cli/")
 }
 
 // ── Tests ──
