@@ -82,7 +82,7 @@ let parsed = almai.parse_content_as_json(r)!
 import almai
 import json
 
-let weather_tool = almai.Tool {
+let weather_tool = Tool {
   name: "get_weather",
   description: "Get current weather for a city",
   parameters: json.object([
@@ -104,7 +104,7 @@ let r = almai.call_with("anthropic/claude-sonnet-4-6", [
 ], opts)!
 
 if almai.has_tool_calls(r) then {
-  let tc = almai.first_tool_call(r) |> option.unwrap_or(almai.ToolCall { id: "", name: "", arguments: "" })
+  let tc = almai.first_tool_call(r) |> option.unwrap_or(ToolCall { id: "", name: "", arguments: "" })
   println("Tool: " + tc.name)
   println("Args: " + tc.arguments)
 } else {
