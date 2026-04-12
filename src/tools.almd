@@ -1,0 +1,139 @@
+// almai.tools — Tool/function calling types and JSON builders
+
+import json
+
+// ── Types ──
+
+type Tool = {
+  name: String,
+  description: String,
+  parameters: Value,
+}
+
+type ToolCall = {
+  id: String,
+  name: String,
+  arguments: String,
+}
+
+// ── Constructors ──
+
+fn tool(name: String, description: String, parameters: Value) -> Tool =
+  Tool { name: name, description: description, parameters: parameters }
+
+fn tool_simple(name: String, description: String) -> Tool =
+  Tool { name: name, description: description, parameters: json.object([]) }
+
+// ── JSON Schema helpers ──
+
+fn param_string(description: String) -> Value =
+  json.object([("type", json.from_string("string")), ("description", json.from_string(description))])
+
+fn param_int(description: String) -> Value =
+  json.object([("type", json.from_string("integer")), ("description", json.from_string(description))])
+
+fn param_bool(description: String) -> Value =
+  json.object([("type", json.from_string("boolean")), ("description", json.from_string(description))])
+
+fn param_enum(description: String, values: List[String]) -> Value =
+  json.object([
+    ("type", json.from_string("string")),
+    ("description", json.from_string(description)),
+    ("enum", json.array(list.map(values, (v) => json.from_string(v)))),
+  ])
+
+fn params(props: List[(String, Value)], required: List[String]) -> Value =
+  json.object([
+    ("type", json.from_string("object")),
+    ("properties", json.object(list.map(props, (p) => (p.0, p.1)))),
+    ("required", json.array(list.map(required, (r) => json.from_string(r)))),
+  ])
+
+// ── Serialization ──
+
+fn tool_to_json(t: Tool) -> Value =
+  json.object([
+    ("type", json.from_string("function")),
+    ("function", json.object([
+      ("name", json.from_string(t.name)),
+      ("description", json.from_string(t.description)),
+      ("parameters", t.parameters),
+    ])),
+  ])
+
+fn tools_to_json(ts: List[Tool]) -> Value =
+  json.array(list.map(ts, (t) => tool_to_json(t)))
+
+// ── Parsing ──
+
+fn parse_tool_calls(v: Value) -> List[ToolCall] =
+  json.get_array(v, "tool_calls")
+    |> option.unwrap_or([])
+    |> list.filter_map((tc) => {
+      let id = json.get_string(tc, "id") |> option.unwrap_or("")
+      let func = json.get(tc, "function") |> option.unwrap_or(json.null())
+      let name = json.get_string(func, "name") |> option.unwrap_or("")
+      let args = json.get_string(func, "arguments") |> option.unwrap_or("{}")
+      if name != "" then some(ToolCall { id: id, name: name, arguments: args })
+      else none
+    })
+
+fn parse_tool_call_args(tc: ToolCall) -> Result[Value, String] =
+  json.parse(tc.arguments)
+
+// ── Tests ──
+
+test "tool_simple creates tool with empty params" {
+  let t = tool_simple("greet", "Say hello")
+  assert_eq(t.name, "greet")
+  assert_eq(t.description, "Say hello")
+}
+
+test "params builds JSON Schema object" {
+  let schema = params([("name", param_string("User name"))], ["name"])
+  let s = json.stringify(schema)
+  assert(string.contains(s, "object"))
+  assert(string.contains(s, "name"))
+}
+
+test "param_enum includes values" {
+  let p = param_enum("Color", ["red", "green", "blue"])
+  let s = json.stringify(p)
+  assert(string.contains(s, "enum"))
+  assert(string.contains(s, "red"))
+}
+
+test "tool_to_json wraps in function type" {
+  let t = tool_simple("test", "A test tool")
+  let j = json.stringify(tool_to_json(t))
+  assert(string.contains(j, "function"))
+  assert(string.contains(j, "test"))
+}
+
+test "parse_tool_calls extracts from JSON" {
+  let raw = json.object([
+    ("tool_calls", json.array([
+      json.object([
+        ("id", json.from_string("call_1")),
+        ("function", json.object([
+          ("name", json.from_string("greet")),
+          ("arguments", json.from_string("{\"name\":\"Alice\"}")),
+        ])),
+      ]),
+    ])),
+  ])
+  let calls = parse_tool_calls(raw)
+  assert_eq(list.len(calls), 1)
+  let first = list.get(calls, 0) |> option.unwrap_or(ToolCall { id: "", name: "", arguments: "" })
+  assert_eq(first.name, "greet")
+  assert_eq(first.id, "call_1")
+}
+
+test "parse_tool_call_args parses JSON" {
+  let tc = ToolCall { id: "1", name: "f", arguments: "{\"x\":42}" }
+  let parsed = parse_tool_call_args(tc)
+  match parsed {
+    ok(v) => assert_eq(json.get_int(v, "x") |> option.unwrap_or(0), 42)
+    err(_) => assert(false)
+  }
+}
