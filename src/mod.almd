@@ -123,8 +123,6 @@ fn has_tool_calls(r: LLMResponse) -> Bool = not list.is_empty(r.tool_calls)
 fn first_tool_call(r: LLMResponse) -> Option[ToolCall] = list.first(r.tool_calls)
 fn parse_content_as_json(r: LLMResponse) -> Result[Value, String] = json.parse(r.content)
 
-effect fn main() -> Unit = {}
-
 // ── Tests ──
 
 test "parse_provider with slash" {
