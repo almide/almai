@@ -19,6 +19,7 @@ import self.providers.anthropic as anthropic_provider
 import self.providers.cloudflare as cf_provider
 import self.providers.azure as azure_provider
 import self.providers.google as google_provider
+import self.providers.bedrock as bedrock_provider
 import self.providers.cli as cli_provider
 
 // ── Core types ──
@@ -105,6 +106,7 @@ effect fn call_with(model_spec: String, msgs: List[Message], opts: CallOptions) 
     "cf" => cf_provider.call(model, msgs, opts),
     "cloudflare" => cf_provider.call(model, msgs, opts),
     "azure" => azure_provider.call(model, msgs, opts),
+    "bedrock" => bedrock_provider.call(model, msgs, opts),
     "google" => google_provider.call(model, msgs, opts),
     "cli" => match model {
       "claude" => cli_provider.call_claude(msgs, opts),
