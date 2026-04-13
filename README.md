@@ -128,6 +128,26 @@ let r = almai.call("anthropic/claude-sonnet-4-6", conv.messages(conversation))!
 println(r.content)
 ```
 
+## Retry on transient errors
+
+`call_retry` wraps the dispatch in an exponential-backoff loop. HTTP 429 / 5xx
+and connection errors are retried; auth / malformed-request errors propagate
+immediately. Initial delay 1000 ms, doubles each retry.
+
+```almide
+import almai
+
+let r = almai.call_retry(
+  "anthropic/claude-sonnet-4-6",
+  [almai.user("Hello")],
+  almai.defaults(),
+  3,                    // max_attempts: 1 try + 2 retries
+)!
+println(r.content)
+```
+
+For custom initial delay, use `call_retry_with_delay(..., max_attempts, base_delay_ms)`.
+
 ## Architecture
 
 ```

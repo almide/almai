@@ -13,6 +13,7 @@
 // Submodules: almai.tools, almai.conv, almai.providers.*
 
 import env
+import int
 import json
 import self.providers.openai as openai_provider
 import self.providers.anthropic as anthropic_provider
@@ -117,6 +118,61 @@ effect fn call_with(model_spec: String, msgs: List[Message], opts: CallOptions) 
   }
 }
 
+// ── Retry support ──
+//
+// HTTP 429 / 5xx and connection errors are transient. `call_retry` wraps the
+// dispatch in an exponential-backoff loop. Non-retriable errors (auth, malformed
+// request, etc.) propagate immediately. Pass `max_attempts: 1` for no retry.
+
+fn is_retriable_error(msg: String) -> Bool =
+  string.contains(msg, "429") or
+  string.contains(msg, "500") or
+  string.contains(msg, "502") or
+  string.contains(msg, "503") or
+  string.contains(msg, "504") or
+  string.contains(msg, "timeout") or
+  string.contains(msg, "Timeout") or
+  string.contains(msg, "connection") or
+  string.contains(msg, "Connection")
+
+effect fn retry_loop(
+  model_spec: String,
+  msgs: List[Message],
+  opts: CallOptions,
+  attempt: Int,
+  max_attempts: Int,
+  delay_ms: Int,
+) -> Result[LLMResponse, String] =
+  match call_with(model_spec, msgs, opts) {
+    ok(r) => ok(r)
+    err(e) =>
+      if attempt >= max_attempts or not is_retriable_error(e) then err(e)
+      else {
+        env.sleep_ms(delay_ms)
+        retry_loop(model_spec, msgs, opts, attempt + 1, max_attempts, delay_ms * 2)
+      }
+  }
+
+// Call with exponential backoff. Initial delay 1000ms, doubles each retry.
+// `max_attempts` includes the first attempt, so 3 means 1 try + 2 retries.
+effect fn call_retry(
+  model_spec: String,
+  msgs: List[Message],
+  opts: CallOptions,
+  max_attempts: Int,
+) -> Result[LLMResponse, String] =
+  retry_loop(model_spec, msgs, opts, 1, max_attempts, 1000)
+
+// Call with custom initial backoff delay (ms).
+effect fn call_retry_with_delay(
+  model_spec: String,
+  msgs: List[Message],
+  opts: CallOptions,
+  max_attempts: Int,
+  base_delay_ms: Int,
+) -> Result[LLMResponse, String] =
+  retry_loop(model_spec, msgs, opts, 1, max_attempts, base_delay_ms)
+
 // ── Response helpers ──
 
 fn has_tool_calls(r: LLMResponse) -> Bool = not list.is_empty(r.tool_calls)
@@ -173,6 +229,29 @@ test "has_tool_calls false" {
     usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     finish_reason: "stop", tool_calls: [] }
   assert_eq(has_tool_calls(r), false)
+}
+
+test "is_retriable_error true for HTTP 429" {
+  assert(is_retriable_error("HTTP 429: too many requests"), "429")
+}
+
+test "is_retriable_error true for HTTP 503" {
+  assert(is_retriable_error("HTTP 503 Service Unavailable"), "503")
+}
+
+test "is_retriable_error true for timeout" {
+  assert(is_retriable_error("request timeout after 30s"), "timeout")
+  assert(is_retriable_error("Timeout reached"), "Timeout")
+}
+
+test "is_retriable_error false for auth errors" {
+  assert(not is_retriable_error("HTTP 401 Unauthorized"), "401")
+  assert(not is_retriable_error("HTTP 403 Forbidden"), "403")
+  assert(not is_retriable_error("HTTP 400 Bad Request"), "400")
+}
+
+test "is_retriable_error false for missing env" {
+  assert(not is_retriable_error("missing env: OPENAI_API_KEY"), "missing env")
 }
 
 test "parse_content_as_json" {
