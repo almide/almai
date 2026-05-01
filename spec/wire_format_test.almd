@@ -1,0 +1,46 @@
+// wire_format_test — verify provider message_to_json shapes for tool roundtrip.
+
+import self as almai
+import self.providers.openai as oai
+import self.providers.anthropic as anth
+import json
+
+test "openai wire format: assistant carries tool_calls, tool message carries tool_call_id" {
+  let assistant_msg = almai.assistant_with_tools(
+    "thinking...",
+    [ToolCall { id: "call_1", name: "Read", arguments: "{\"path\":\"/a\"}" }],
+  )
+  let tool_msg = almai.tool_result("call_1", "file contents")
+  let s = json.stringify(oai.messages_to_json([assistant_msg, tool_msg]))
+  assert(string.contains(s, "\"tool_calls\""), "openai assistant should have tool_calls")
+  assert(string.contains(s, "\"tool_call_id\":\"call_1\""), "openai tool message should carry tool_call_id")
+  assert(string.contains(s, "\"function\""), "openai tool_call should be wrapped under function")
+  assert(string.contains(s, "\"name\":\"Read\""), "tool_call name preserved")
+}
+
+test "anthropic wire format: tool_use blocks + role:user tool_result" {
+  let assistant_msg = almai.assistant_with_tools(
+    "thinking...",
+    [ToolCall { id: "call_1", name: "Read", arguments: "{\"path\":\"/a\"}" }],
+  )
+  let tool_msg = almai.tool_result("call_1", "file contents")
+  let s = json.stringify(anth.messages_to_json([assistant_msg, tool_msg]))
+  assert(string.contains(s, "\"tool_use\""), "anthropic assistant should have tool_use content block")
+  assert(string.contains(s, "\"tool_result\""), "anthropic should emit tool_result block")
+  assert(string.contains(s, "\"tool_use_id\":\"call_1\""), "anthropic tool_result needs tool_use_id")
+  // anthropic has no "tool" role — tool results come back as user messages.
+  assert(not string.contains(s, "\"role\":\"tool\""), "anthropic must not emit role:tool")
+}
+
+test "openai legacy assistant (no tool_calls) stays minimal" {
+  let m = almai.assistant("plain response")
+  let s = json.stringify(oai.messages_to_json([m]))
+  assert(not string.contains(s, "\"tool_calls\""), "assistant without tools should not emit tool_calls")
+}
+
+test "anthropic plain user message uses string content (not block array)" {
+  let m = almai.user("hello")
+  let s = json.stringify(anth.messages_to_json([m]))
+  assert(string.contains(s, "\"content\":\"hello\""), "plain content stays as string")
+  assert(not string.contains(s, "\"tool_use\""), "no tool blocks for plain user message")
+}

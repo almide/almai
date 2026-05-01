@@ -39,3 +39,25 @@ test "with_tools" {
   let opts = almai.defaults() |> almai.with_tools(ts)
   assert_eq(list.len(opts.tools), 1)
 }
+
+test "tool_result constructor sets tool_call_id" {
+  let m = almai.tool_result("call_abc", "42")
+  assert_eq(m.role, "tool")
+  assert_eq(m.content, "42")
+  assert_eq(m.tool_call_id, "call_abc")
+}
+
+test "assistant_with_tools preserves tool_calls" {
+  let tcs = [ToolCall { id: "c1", name: "Read", arguments: "{\"path\":\"/a\"}" }]
+  let m = almai.assistant_with_tools("calling tool", tcs)
+  assert_eq(m.role, "assistant")
+  assert_eq(m.content, "calling tool")
+  assert_eq(list.len(m.tool_calls), 1)
+}
+
+test "default fields apply to legacy constructors" {
+  // user / system / assistant should still work with no tool fields supplied
+  let u = almai.user("hi")
+  assert_eq(u.tool_call_id, "")
+  assert_eq(list.len(u.tool_calls), 0)
+}
