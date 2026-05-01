@@ -1,0 +1,28 @@
+// cli_smoke — exercise call_claude with a multi-turn conversation.
+//
+// Requires a working `claude` CLI on $PATH. Run:
+//   almide run spec/cli_smoke.almd
+
+import self as almai
+import self.providers.cli as cli_provider
+
+effect fn main() -> Unit = {
+  let opts = almai.defaults() |> almai.with_system("You are a terse assistant.")
+
+  // Single-turn check
+  match cli_provider.call_claude([almai.user("Reply with exactly the word 'pong'.")], opts) {
+    err(e) => println("[single] FAIL: ${e}")
+    ok(r) => println("[single] response: ${r.content} (input=${int.to_string(r.usage.prompt_tokens)} output=${int.to_string(r.usage.completion_tokens)})")
+  }
+
+  // Multi-turn check — verify history is being passed through
+  let multi = [
+    almai.user("My favourite colour is teal."),
+    almai.assistant("noted"),
+    almai.user("What did I say my favourite colour was? One word."),
+  ]
+  match cli_provider.call_claude(multi, opts) {
+    err(e) => println("[multi] FAIL: ${e}")
+    ok(r) => println("[multi] response: ${r.content}")
+  }
+}
