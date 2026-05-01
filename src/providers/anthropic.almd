@@ -112,3 +112,58 @@ effect fn call(model: String, msgs: List[Message], opts: CallOptions) -> Result[
       }
     }
   }
+
+// Build the Messages API request body. Mirrors `call`'s body
+// construction so streaming + non-streaming share the wire format.
+fn build_body(model: String, msgs: List[Message], opts: CallOptions, stream: Bool) -> Value = {
+  let user_msgs = list.filter(msgs, (m) => m.role != "system")
+  let sys = if opts.system != "" then opts.system
+    else list.find(msgs, (m) => m.role == "system") |> option.map((m) => m.content) |> option.unwrap_or("")
+  let fields = [("model", json.from_string(model)), ("max_tokens", json.from_int(opts.max_tokens)), ("messages", messages_to_json(user_msgs))]
+  let fields = if sys != "" then fields + [("system", json.from_string(sys))] else fields
+  let fields = if not list.is_empty(opts.tools) then
+    fields + [("tools", json.array(list.map(opts.tools, (t) => json.object([
+      ("name", json.from_string(t.name)), ("description", json.from_string(t.description)), ("input_schema", t.parameters)]))))]
+  else fields
+  let fields = if stream then fields + [("stream", json.from_bool(true))] else fields
+  json.object(fields)
+}
+
+// Streaming call. Routes through almide's `http.anthropic_streaming_call`
+// intrinsic which handles the (event:/data:) SSE wire shape and
+// content_block_start / content_block_delta / message_delta accumulation.
+// Returns the same shape as `openai.call_streaming`.
+effect fn call_streaming(model: String, msgs: List[Message], opts: CallOptions, on_text_delta: (String) -> Unit) -> Result[LLMResponse, String] =
+  match require_env("ANTHROPIC_API_KEY") {
+    err(e) => err(e)
+    ok(api_key) => {
+      let body_json = json.stringify(build_body(model, msgs, opts, true))
+      match http.anthropic_streaming_call(api_key, body_json, on_text_delta) {
+        err(e) => err("anthropic streaming: " + e)
+        ok(raw) => match json.parse(raw) {
+          err(e) => err("anthropic streaming: parse aggregate: " + e)
+          ok(parsed) => {
+            let tool_calls_arr = json.get_array(parsed, "tool_calls") |> option.unwrap_or([])
+            let tool_calls = tool_calls_arr |> list.filter_map((tc) => {
+              let id = json.get_string(tc, "id") |> option.unwrap_or("")
+              let name = json.get_string(tc, "name") |> option.unwrap_or("")
+              let args = json.get_string(tc, "arguments") |> option.unwrap_or("{}")
+              if name != "" then some(ToolCall { id: id, name: name, arguments: args }) else none
+            })
+            let usage_obj = json.get(parsed, "usage") |> option.unwrap_or(json.null())
+            ok(LLMResponse {
+              content: json.get_string(parsed, "content") |> option.unwrap_or(""),
+              model: json.get_string(parsed, "model") |> option.unwrap_or(""),
+              usage: Usage {
+                prompt_tokens: json.get_int(usage_obj, "prompt_tokens") |> option.unwrap_or(0),
+                completion_tokens: json.get_int(usage_obj, "completion_tokens") |> option.unwrap_or(0),
+                total_tokens: json.get_int(usage_obj, "total_tokens") |> option.unwrap_or(0),
+              },
+              finish_reason: json.get_string(parsed, "finish_reason") |> option.unwrap_or("end_turn"),
+              tool_calls: tool_calls,
+            })
+          }
+        }
+      }
+    }
+  }
