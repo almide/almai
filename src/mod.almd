@@ -25,7 +25,18 @@ import self.providers.cli as cli_provider
 
 // ── Core types ──
 
-type Message = { role: String, content: String }
+type Message = {
+  role: String,
+  content: String,
+  // Set on role:"tool" messages so providers (OpenAI / Anthropic) can
+  // correlate the result back to the assistant's tool_use call. Empty
+  // string means "not a tool result".
+  tool_call_id: String = "",
+  // Set on role:"assistant" messages that the model emitted with tool
+  // calls. Carrying these through history is what lets providers see
+  // the proper assistant → tool_result roundtrip.
+  tool_calls: List[ToolCall] = [],
+}
 
 type LLMResponse = {
   content: String,
@@ -54,7 +65,10 @@ type CallOptions = {
 fn system(content: String) -> Message = Message { role: "system", content: content }
 fn user(content: String) -> Message = Message { role: "user", content: content }
 fn assistant(content: String) -> Message = Message { role: "assistant", content: content }
-fn tool_result(tool_call_id: String, content: String) -> Message = Message { role: "tool", content: content }
+fn assistant_with_tools(content: String, tool_calls: List[ToolCall]) -> Message =
+  Message { role: "assistant", content: content, tool_calls: tool_calls }
+fn tool_result(tool_call_id: String, content: String) -> Message =
+  Message { role: "tool", content: content, tool_call_id: tool_call_id }
 
 // ── Options builder ──
 

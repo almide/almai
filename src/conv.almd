@@ -6,9 +6,13 @@ type Conversation = {
   messages: List[Message],
 }
 
+type ToolCall = { id: String, name: String, arguments: String }
+
 type Message = {
   role: String,
   content: String,
+  tool_call_id: String = "",
+  tool_calls: List[ToolCall] = [],
 }
 
 // ── Constructors ──
@@ -32,8 +36,11 @@ fn add_user(conv: Conversation, content: String) -> Conversation =
 fn add_assistant(conv: Conversation, content: String) -> Conversation =
   add(conv, "assistant", content)
 
+fn add_assistant_with_tools(conv: Conversation, content: String, tool_calls: List[ToolCall]) -> Conversation =
+  Conversation { messages: conv.messages + [Message { role: "assistant", content: content, tool_calls: tool_calls }] }
+
 fn add_tool_result(conv: Conversation, tool_call_id: String, content: String) -> Conversation =
-  Conversation { messages: conv.messages + [Message { role: "tool", content: content }] }
+  Conversation { messages: conv.messages + [Message { role: "tool", content: content, tool_call_id: tool_call_id }] }
 
 // ── Query ──
 

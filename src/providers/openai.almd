@@ -4,16 +4,46 @@ import env
 import http
 import json
 
-type Message = { role: String, content: String }
+type ToolCall = { id: String, name: String, arguments: String }
+type Message = {
+  role: String,
+  content: String,
+  tool_call_id: String = "",
+  tool_calls: List[ToolCall] = [],
+}
 type LLMResponse = { content: String, model: String, usage: Usage, finish_reason: String, tool_calls: List[ToolCall] }
 type Usage = { prompt_tokens: Int, completion_tokens: Int, total_tokens: Int }
-type ToolCall = { id: String, name: String, arguments: String }
 type Tool = { name: String, description: String, parameters: Value }
 type CallOptions = { max_tokens: Int, temperature: Float, top_p: Float, system: String, stop: List[String], tools: List[Tool], json_mode: Bool }
 
+// Emit a single tool_call as the OpenAI Chat Completions wire shape:
+//   {"id": "...", "type": "function", "function": {"name": "...", "arguments": "..."}}
+fn tool_call_to_json(tc: ToolCall) -> Value =
+  json.object([
+    ("id", json.from_string(tc.id)),
+    ("type", json.from_string("function")),
+    ("function", json.object([
+      ("name", json.from_string(tc.name)),
+      ("arguments", json.from_string(tc.arguments)),
+    ])),
+  ])
+
+fn message_to_json(m: Message) -> Value = {
+  // Base shape — every message has role + content
+  let base = [("role", json.from_string(m.role)), ("content", json.from_string(m.content))]
+  // role:"assistant" with tool_calls → emit `tool_calls` array
+  let with_tool_calls = if m.role == "assistant" and not list.is_empty(m.tool_calls) then
+    base + [("tool_calls", json.array(list.map(m.tool_calls, (tc) => tool_call_to_json(tc))))]
+  else base
+  // role:"tool" requires `tool_call_id` to correlate with the assistant call
+  let with_id = if m.role == "tool" and m.tool_call_id != "" then
+    with_tool_calls + [("tool_call_id", json.from_string(m.tool_call_id))]
+  else with_tool_calls
+  json.object(with_id)
+}
+
 fn messages_to_json(msgs: List[Message]) -> Value =
-  json.array(list.map(msgs, (m) =>
-    json.object([("role", json.from_string(m.role)), ("content", json.from_string(m.content))])))
+  json.array(list.map(msgs, (m) => message_to_json(m)))
 
 fn tools_to_json(ts: List[Tool]) -> Value =
   json.array(list.map(ts, (t) =>

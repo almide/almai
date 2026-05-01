@@ -4,16 +4,64 @@ import env
 import http
 import json
 
-type Message = { role: String, content: String }
+type ToolCall = { id: String, name: String, arguments: String }
+type Message = {
+  role: String,
+  content: String,
+  tool_call_id: String = "",
+  tool_calls: List[ToolCall] = [],
+}
 type LLMResponse = { content: String, model: String, usage: Usage, finish_reason: String, tool_calls: List[ToolCall] }
 type Usage = { prompt_tokens: Int, completion_tokens: Int, total_tokens: Int }
-type ToolCall = { id: String, name: String, arguments: String }
 type Tool = { name: String, description: String, parameters: Value }
 type CallOptions = { max_tokens: Int, temperature: Float, top_p: Float, system: String, stop: List[String], tools: List[Tool], json_mode: Bool }
 
+// Anthropic wire format: assistant tool_use lives in `content` as a block
+// array, and tool results come back as role:"user" with a `tool_result`
+// content block (Anthropic does not have a separate "tool" role).
+
+fn tool_use_block(tc: ToolCall) -> Value =
+  json.object([
+    ("type", json.from_string("tool_use")),
+    ("id", json.from_string(tc.id)),
+    ("name", json.from_string(tc.name)),
+    // `arguments` is a JSON-encoded string in our generic ToolCall;
+    // Anthropic expects a JSON object. Parse if possible, fall back to {}.
+    ("input", match json.parse(tc.arguments) {
+      ok(v) => v,
+      err(_) => json.object([]),
+    }),
+  ])
+
+fn text_block(content: String) -> Value =
+  json.object([("type", json.from_string("text")), ("text", json.from_string(content))])
+
+fn assistant_blocks(m: Message) -> Value = {
+  let text = if m.content != "" then [text_block(m.content)] else []
+  let tools = list.map(m.tool_calls, (tc) => tool_use_block(tc))
+  json.array(text + tools)
+}
+
+fn tool_result_block(m: Message) -> Value =
+  json.object([
+    ("type", json.from_string("tool_result")),
+    ("tool_use_id", json.from_string(m.tool_call_id)),
+    ("content", json.from_string(m.content)),
+  ])
+
+fn message_to_json(m: Message) -> Value = {
+  let role = if m.role == "tool" then "user" else m.role
+  let content = if m.role == "tool" then
+    json.array([tool_result_block(m)])
+  else if m.role == "assistant" and not list.is_empty(m.tool_calls) then
+    assistant_blocks(m)
+  else
+    json.from_string(m.content)
+  json.object([("role", json.from_string(role)), ("content", content)])
+}
+
 fn messages_to_json(msgs: List[Message]) -> Value =
-  json.array(list.map(msgs, (m) =>
-    json.object([("role", json.from_string(m.role)), ("content", json.from_string(m.content))])))
+  json.array(list.map(msgs, (m) => message_to_json(m)))
 
 fn es(v: Value, key: String) -> String = json.get_string(v, key) |> option.unwrap_or("")
 

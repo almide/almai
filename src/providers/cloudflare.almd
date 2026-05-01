@@ -4,7 +4,12 @@ import env
 import http
 import json
 
-type Message = { role: String, content: String }
+type Message = {
+  role: String,
+  content: String,
+  tool_call_id: String = "",
+  tool_calls: List[ToolCall] = [],
+}
 type LLMResponse = { content: String, model: String, usage: Usage, finish_reason: String, tool_calls: List[ToolCall] }
 type Usage = { prompt_tokens: Int, completion_tokens: Int, total_tokens: Int }
 type ToolCall = { id: String, name: String, arguments: String }
