@@ -9,7 +9,7 @@
 //   ])!
 //   println(r.content)
 //
-// Providers: anthropic/, openai/, openrouter/, cf/, azure/, google/, cli/
+// Providers: anthropic/, openai/, openrouter/, groq/, cf/, azure/, google/, cli/
 // Submodules: almai.tools, almai.conv, almai.providers.*
 
 import env
@@ -117,6 +117,10 @@ effect fn call_with(model_spec: String, msgs: List[Message], opts: CallOptions) 
     "openrouter" => match require_env("OPENROUTER_API_KEY") {
       err(e) => err(e)
       ok(key) => openai_provider.call("https://openrouter.ai/api/v1", key, model, msgs, opts)
+    },
+    "groq" => match require_env("GROQ_API_KEY") {
+      err(e) => err(e)
+      ok(key) => openai_provider.call("https://api.groq.com/openai/v1", key, model, msgs, opts)
     },
     "cf" => cf_provider.call(model, msgs, opts),
     "cloudflare" => cf_provider.call(model, msgs, opts),
