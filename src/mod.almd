@@ -116,6 +116,7 @@ effect fn call_streaming(model_spec: String, msgs: List[Message], opts: CallOpti
   let provider = parsed.0
   let model = parsed.1
   match provider {
+    "anthropic" => anthropic_provider.call_streaming(model, msgs, opts, on_text_delta),
     "openai" => match require_env("OPENAI_API_KEY") {
       err(e) => err(e)
       ok(key) => openai_provider.call_streaming("https://api.openai.com/v1", key, model, msgs, opts, on_text_delta)
