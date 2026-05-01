@@ -1,5 +1,23 @@
+// almai.providers.cli — CLI-based providers (Claude Code, Codex CLI).
+//
+// `claude -p` and `codex exec` run a local agent under the hood, not a
+// raw model — they internally dispatch tools, fetch context, etc., and
+// return a final assistant text. As a consequence:
+//
+//   - We pass the WHOLE conversation as a stuffed-prompt block, since
+//     `-p` mode is single-turn and has no built-in history channel.
+//   - We use `--output-format json` for structured output (content +
+//     usage + session id), falling back to plain text on parse failure.
+//   - `tool_calls` is always [] in the response: tool execution
+//     happens inside Claude Code, not in the caller's tool runtime.
+//
+// If you need explicit tool_use roundtrips, use the anthropic/openai
+// providers instead — those expose the model directly.
+
+import json
 import process
 
+type ToolCall = { id: String, name: String, arguments: String }
 type Message = {
   role: String,
   content: String,
@@ -8,9 +26,10 @@ type Message = {
 }
 type LLMResponse = { content: String, model: String, usage: Usage, finish_reason: String, tool_calls: List[ToolCall] }
 type Usage = { prompt_tokens: Int, completion_tokens: Int, total_tokens: Int }
-type ToolCall = { id: String, name: String, arguments: String }
-type CallOptions = { max_tokens: Int, temperature: Float, top_p: Float, system: String, stop: List[String], tools: List[Tool], json_mode: Bool }
 type Tool = { name: String, description: String, parameters: Value }
+type CallOptions = { max_tokens: Int, temperature: Float, top_p: Float, system: String, stop: List[String], tools: List[Tool], json_mode: Bool }
+
+// ── Helpers ──
 
 fn resolve_system(msgs: List[Message], opts: CallOptions) -> String =
   if opts.system != "" then opts.system
@@ -20,24 +39,74 @@ fn resolve_system(msgs: List[Message], opts: CallOptions) -> String =
 fn last_user(msgs: List[Message]) -> String =
   list.last(msgs) |> option.map((m) => m.content) |> option.unwrap_or("")
 
-effect fn call_claude(msgs: List[Message], opts: CallOptions) -> Result[LLMResponse, String] = {
-  let user_msg = last_user(msgs)
-  let sys = resolve_system(msgs, opts)
-  let args = if sys != "" then ["--print", "--system-prompt", sys, user_msg] else ["--print", user_msg]
-  match process.exec("claude", args) {
-    err(e) => err("claude cli: " + e)
-    ok(raw) => ok(LLMResponse {
+// Render a multi-turn conversation as a single stuffed-prompt block.
+// Each message becomes a labelled section; the trailing user message
+// becomes the active prompt. Skips system messages (passed via flag).
+fn render_history(msgs: List[Message]) -> String = {
+  let user_msgs = list.filter(msgs, (m) => m.role != "system")
+  match list.len(user_msgs) {
+    0 => ""
+    1 => list.first(user_msgs) |> option.map((m) => m.content) |> option.unwrap_or("")
+    _ => {
+      let label = (m: Message) => match m.role {
+        "user" => "User"
+        "assistant" => "Assistant"
+        "tool" => "Tool result"
+        _ => m.role
+      }
+      user_msgs
+        |> list.map((m) => "${label(m)}:\n${m.content}")
+        |> list.join("\n\n")
+    }
+  }
+}
+
+// Parse a `claude --output-format json` response, falling back to
+// raw-text on JSON parse failure (in case an older claude version
+// or a non-JSON build of the CLI is installed).
+fn parse_claude_json(raw: String) -> LLMResponse = {
+  match json.parse(raw) {
+    err(_) => LLMResponse {
       content: string.trim(raw), model: "claude-cli",
       usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
       finish_reason: "stop", tool_calls: [],
-    })
+    }
+    ok(v) => {
+      let result_text = json.get_string(v, "result") |> option.unwrap_or(string.trim(raw))
+      let usage_obj = json.get(v, "usage") |> option.unwrap_or(json.null())
+      let in_tok  = json.get_int(usage_obj, "input_tokens")  |> option.unwrap_or(0)
+      let out_tok = json.get_int(usage_obj, "output_tokens") |> option.unwrap_or(0)
+      let model = json.get_string(v, "session_id") |> option.unwrap_or("claude-cli")
+      LLMResponse {
+        content: string.trim(result_text), model: model,
+        usage: Usage { prompt_tokens: in_tok, completion_tokens: out_tok, total_tokens: in_tok + out_tok },
+        finish_reason: "stop", tool_calls: [],
+      }
+    }
+  }
+}
+
+// ── Providers ──
+
+effect fn call_claude(msgs: List[Message], opts: CallOptions) -> Result[LLMResponse, String] = {
+  let prompt = render_history(msgs)
+  let sys = resolve_system(msgs, opts)
+  let base_args = ["--print", "--output-format", "json"]
+  let args =
+    if sys != "" then base_args + ["--system-prompt", sys, prompt]
+    else base_args + [prompt]
+  match process.exec("claude", args) {
+    err(e) => err("claude cli: ${e}")
+    ok(raw) => ok(parse_claude_json(raw))
   }
 }
 
 effect fn call_codex(msgs: List[Message], opts: CallOptions) -> Result[LLMResponse, String] = {
+  // codex exec doesn't yet expose a JSON output mode — keep the
+  // single-message text protocol used previously.
   let user_msg = last_user(msgs)
   match process.exec("codex", ["exec", user_msg]) {
-    err(e) => err("codex cli: " + e)
+    err(e) => err("codex cli: ${e}")
     ok(raw) => ok(LLMResponse {
       content: string.trim(raw), model: "codex-cli",
       usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
@@ -46,8 +115,50 @@ effect fn call_codex(msgs: List[Message], opts: CallOptions) -> Result[LLMRespon
   }
 }
 
+// ── Tests ──
+
 test "resolve_system from opts" {
   let msgs = [Message { role: "user", content: "hi" }]
   let opts = CallOptions { max_tokens: 100, temperature: 0.0, top_p: 1.0, system: "sys", stop: [], tools: [], json_mode: false }
   assert_eq(resolve_system(msgs, opts), "sys")
+}
+
+test "render_history single user message → bare content" {
+  let msgs = [Message { role: "user", content: "hello" }]
+  assert_eq(render_history(msgs), "hello")
+}
+
+test "render_history skips system message" {
+  let msgs = [
+    Message { role: "system", content: "be terse" },
+    Message { role: "user", content: "hi" },
+  ]
+  assert_eq(render_history(msgs), "hi")
+}
+
+test "render_history labels multi-turn" {
+  let msgs = [
+    Message { role: "user", content: "first" },
+    Message { role: "assistant", content: "ack" },
+    Message { role: "user", content: "second" },
+  ]
+  let out = render_history(msgs)
+  assert(string.contains(out, "User:\nfirst"))
+  assert(string.contains(out, "Assistant:\nack"))
+  assert(string.contains(out, "User:\nsecond"))
+}
+
+test "parse_claude_json: extracts result and usage" {
+  let raw = "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"hi there\",\"usage\":{\"input_tokens\":12,\"output_tokens\":3},\"session_id\":\"sess_42\"}"
+  let r = parse_claude_json(raw)
+  assert_eq(r.content, "hi there")
+  assert_eq(r.usage.prompt_tokens, 12)
+  assert_eq(r.usage.completion_tokens, 3)
+  assert_eq(r.usage.total_tokens, 15)
+}
+
+test "parse_claude_json: falls back to raw text on parse failure" {
+  let r = parse_claude_json("not json at all")
+  assert_eq(r.content, "not json at all")
+  assert_eq(r.usage.total_tokens, 0)
 }
