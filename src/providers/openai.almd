@@ -79,7 +79,8 @@ effect fn post_json(url: String, body: Value, headers: Map[String, String]) -> R
     }
   }
 
-effect fn call(base_url: String, api_key: String, model: String, msgs: List[Message], opts: CallOptions) -> Result[LLMResponse, String] = {
+// Build the request body shared by streaming + non-streaming paths.
+fn build_body(model: String, msgs: List[Message], opts: CallOptions, stream: Bool) -> Value = {
   let sys_msgs = if opts.system != "" then [Message { role: "system", content: opts.system }] else []
   let all_msgs = sys_msgs + msgs
   let fields = [("model", json.from_string(model)), ("messages", messages_to_json(all_msgs)),
@@ -87,7 +88,13 @@ effect fn call(base_url: String, api_key: String, model: String, msgs: List[Mess
   let fields = if not list.is_empty(opts.tools) then fields + [("tools", tools_to_json(opts.tools))] else fields
   let fields = if opts.json_mode then fields + [("response_format", json.object([("type", json.from_string("json_object"))]))] else fields
   let fields = if not list.is_empty(opts.stop) then fields + [("stop", json.array(list.map(opts.stop, (s) => json.from_string(s))))] else fields
-  match post_json(base_url + "/chat/completions", json.object(fields), ["Authorization": "Bearer " + api_key, "Content-Type": "application/json"]) {
+  let fields = if stream then fields + [("stream", json.from_bool(true))] else fields
+  json.object(fields)
+}
+
+effect fn call(base_url: String, api_key: String, model: String, msgs: List[Message], opts: CallOptions) -> Result[LLMResponse, String] = {
+  let body = build_body(model, msgs, opts, false)
+  match post_json(base_url + "/chat/completions", body, ["Authorization": "Bearer " + api_key, "Content-Type": "application/json"]) {
     err(e) => err(e)
     ok(parsed) => {
       let choice = json.get_array(parsed, "choices") |> option.flat_map((cs) => list.first(cs)) |> option.unwrap_or(json.null())
@@ -95,6 +102,53 @@ effect fn call(base_url: String, api_key: String, model: String, msgs: List[Mess
       ok(LLMResponse { content: string.trim(json.get_string(msg, "content") |> option.unwrap_or("")),
         model: json.get_string(parsed, "model") |> option.unwrap_or(""), usage: parse_usage(parsed),
         finish_reason: json.get_string(choice, "finish_reason") |> option.unwrap_or("stop"), tool_calls: parse_tool_calls(msg) })
+    }
+  }
+}
+
+// Streaming call. Routes through almide's `http.openai_streaming_call`
+// intrinsic which owns the SSE parsing in Rust and delivers each new
+// `delta.content` fragment to `on_text_delta` as it arrives. Returns a
+// fully assembled LLMResponse on completion (content / tool_calls /
+// usage all concatenated server-side).
+//
+// Use this in REPLs / agents that want responses to feel live. For
+// agents that only need the final aggregate, the non-streaming `call`
+// is simpler.
+effect fn call_streaming(
+  base_url: String,
+  api_key: String,
+  model: String,
+  msgs: List[Message],
+  opts: CallOptions,
+  on_text_delta: (String) -> Unit,
+) -> Result[LLMResponse, String] = {
+  let body_json = json.stringify(build_body(model, msgs, opts, true))
+  match http.openai_streaming_call(base_url, api_key, body_json, on_text_delta) {
+    err(e) => err("streaming: " + e)
+    ok(raw) => match json.parse(raw) {
+      err(e) => err("streaming: parse aggregate: " + e)
+      ok(parsed) => {
+        let tool_calls_arr = json.get_array(parsed, "tool_calls") |> option.unwrap_or([])
+        let tool_calls = tool_calls_arr |> list.filter_map((tc) => {
+          let id = json.get_string(tc, "id") |> option.unwrap_or("")
+          let name = json.get_string(tc, "name") |> option.unwrap_or("")
+          let args = json.get_string(tc, "arguments") |> option.unwrap_or("{}")
+          if name != "" then some(ToolCall { id: id, name: name, arguments: args }) else none
+        })
+        let usage_obj = json.get(parsed, "usage") |> option.unwrap_or(json.null())
+        ok(LLMResponse {
+          content: json.get_string(parsed, "content") |> option.unwrap_or(""),
+          model: json.get_string(parsed, "model") |> option.unwrap_or(""),
+          usage: Usage {
+            prompt_tokens: json.get_int(usage_obj, "prompt_tokens") |> option.unwrap_or(0),
+            completion_tokens: json.get_int(usage_obj, "completion_tokens") |> option.unwrap_or(0),
+            total_tokens: json.get_int(usage_obj, "total_tokens") |> option.unwrap_or(0),
+          },
+          finish_reason: json.get_string(parsed, "finish_reason") |> option.unwrap_or("stop"),
+          tool_calls: tool_calls,
+        })
+      }
     }
   }
 }

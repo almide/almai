@@ -104,6 +104,34 @@ effect fn require_env(key: String) -> Result[String, String] =
 effect fn call(model_spec: String, msgs: List[Message]) -> Result[LLMResponse, String] =
   call_with(model_spec, msgs, defaults())
 
+// Streaming variant of `call_with`. Token-level deltas are delivered to
+// the `on_text_delta` callback as they arrive; the final aggregated
+// LLMResponse comes back via the Result.
+//
+// Provider support: openai, openrouter, groq (all via the shared OpenAI
+// SSE wrapper). Other providers fall back with an explicit error so the
+// caller can choose to retry via the non-streaming `call_with`.
+effect fn call_streaming(model_spec: String, msgs: List[Message], opts: CallOptions, on_text_delta: (String) -> Unit) -> Result[LLMResponse, String] = {
+  let parsed = parse_provider(model_spec)
+  let provider = parsed.0
+  let model = parsed.1
+  match provider {
+    "openai" => match require_env("OPENAI_API_KEY") {
+      err(e) => err(e)
+      ok(key) => openai_provider.call_streaming("https://api.openai.com/v1", key, model, msgs, opts, on_text_delta)
+    },
+    "openrouter" => match require_env("OPENROUTER_API_KEY") {
+      err(e) => err(e)
+      ok(key) => openai_provider.call_streaming("https://openrouter.ai/api/v1", key, model, msgs, opts, on_text_delta)
+    },
+    "groq" => match require_env("GROQ_API_KEY") {
+      err(e) => err(e)
+      ok(key) => openai_provider.call_streaming("https://api.groq.com/openai/v1", key, model, msgs, opts, on_text_delta)
+    },
+    _ => err("call_streaming: provider '${provider}' does not support streaming yet (use call_with for non-streaming)")
+  }
+}
+
 effect fn call_with(model_spec: String, msgs: List[Message], opts: CallOptions) -> Result[LLMResponse, String] = {
   let parsed = parse_provider(model_spec)
   let provider = parsed.0

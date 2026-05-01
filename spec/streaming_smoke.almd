@@ -1,0 +1,17 @@
+import self as almai
+import io
+
+effect fn main() -> Unit = {
+  let opts = almai.defaults() |> almai.with_max_tokens(60) |> almai.with_system("You are concise.")
+  match almai.call_streaming("groq/llama-3.3-70b-versatile",
+    [almai.user("Count from 1 to 5, one per line, no other text.")],
+    opts,
+    (delta) => io.print(delta)) {
+    err(e) => println("\nFAIL: ${e}")
+    ok(r) => {
+      println("\n---")
+      println("model: ${r.model}")
+      println("tokens: ${int.to_string(r.usage.total_tokens)} (in:${int.to_string(r.usage.prompt_tokens)} out:${int.to_string(r.usage.completion_tokens)})")
+    }
+  }
+}
